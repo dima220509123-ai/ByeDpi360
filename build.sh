@@ -13,7 +13,7 @@ curl -fsSL -o xsdk_plugin.ld https://raw.githubusercontent.com/xenosworks/xsdk/m
 python3 gen_imports.py imports.txt imports_gen
 
 $PPC-gcc -O2 -nostdlib -ffreestanding -fno-builtin \
-    -msdata=none -msdata2=none -msoft-float -mno-altivec \
+    -msoft-float -mno-altivec \
     -c plugin.c -o build/plugin.o
 
 for f in imports_gen/*.S; do
