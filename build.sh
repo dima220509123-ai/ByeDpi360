@@ -164,11 +164,11 @@ static int find_bytes(const unsigned char *hay, int hlen, const char *needle)
 
 static int hooked_send(uint32_t caller, uint32_t s, const char *buf, int len, int flags)
 {
-    if (!buf || len <= 6) return call_send(caller, s, buf, len, flags);
+    if (!buf || len <= 16) return call_send(caller, s, buf, len, flags);
     if (!tls_hello((const uint8_t *)buf, len)) return call_send(caller, s, buf, len, flags);
 
-    /* ByeByeDPI style: fake ClientHello with a mangled SNI, low TTL so only the
-       DPI sees it, then the untouched real ClientHello with a normal TTL. */
+    /* ByeByeDPI style: fake ClientHello with a mangled SNI at low TTL, then the
+       real ClientHello with its TLS record split just before the SNI field. */
     unsigned char fake[2048];
     int n = len;
     if (n > (int)sizeof(fake)) n = (int)sizeof(fake);
@@ -178,9 +178,11 @@ static int hooked_send(uint32_t caller, uint32_t s, const char *buf, int len, in
         "youtubei.googleapis.com", "googlevideo.com", "www.youtube.com",
         "youtube.com", "googleapis.com", "google.com"
     };
+    int sni = -1;
     for (unsigned d = 0; d < sizeof(domains)/sizeof(domains[0]); d++) {
         int pos;
         while ((pos = find_bytes(fake, n, domains[d])) >= 0) {
+            if (sni < 0 || pos < sni) sni = pos;
             int k = 0;
             while (domains[d][k]) k++;
             for (int j = 0; j < k; j++) fake[pos + j] = 'a';
@@ -195,9 +197,29 @@ static int hooked_send(uint32_t caller, uint32_t s, const char *buf, int len, in
         real_setsockopt(caller, s, 0, 2, (const char *)&normal_ttl, 4);
     }
 
+    /* --tlsrec -5+s: insert a new TLS record header 5 bytes before the SNI. */
+    unsigned char real[2056];
+    int split = sni - 5;
+    if (split > 16 && split < len - 5 && len + 5 <= (int)sizeof(real)) {
+        copy_bytes(real, buf, (uint32_t)split);
+        int first_record_len = split - 5;
+        real[3] = (unsigned char)(first_record_len >> 8);
+        real[4] = (unsigned char)(first_record_len & 0xFF);
+        real[split]     = 0x16;
+        real[split + 1] = buf[1];
+        real[split + 2] = buf[2];
+        int second_record_len = len - split;
+        real[split + 3] = (unsigned char)(second_record_len >> 8);
+        real[split + 4] = (unsigned char)(second_record_len & 0xFF);
+        copy_bytes(real + split + 5, buf + split, (uint32_t)(len - split));
+        call_send(caller, s, (const char *)real, len + 5, flags);
+    } else {
+        call_send(caller, s, buf, len, flags);
+    }
+
     fragments++;
-    if (fragments < 5) log_line("fake s=%u len=%d total=%u", s, len, fragments);
-    return call_send(caller, s, buf, len, flags);
+    if (fragments < 5) log_line("tlsrec s=%u len=%d sni=%d total=%u", s, len, sni, fragments);
+    return len;
 }
 
 static int hooked_connect(uint32_t caller, uint32_t s, const void *name, int namelen)
