@@ -27,6 +27,7 @@ xboxkrnl.exe  0x0CF  NtClose
 xboxkrnl.exe  0x0D2  NtCreateFile
 xboxkrnl.exe  0x0FF  NtWriteFile
 xboxkrnl.exe  0x14D  _vsnprintf
+xboxkrnl.exe  0x05A  KeDelayExecutionThread
 xboxkrnl.exe  0x195  XexGetModuleHandle
 xboxkrnl.exe  0x197  XexGetProcedureAddress
 EOF
@@ -54,6 +55,7 @@ NTSTATUS NtWriteFile(HANDLE file, void *event, void *apc, void *context,
                      void *byte_offset, void *key);
 NTSTATUS NtClose(HANDLE handle);
 NTSTATUS _vsnprintf(char *buffer, uint32_t count, const char *format, va_list args);
+NTSTATUS KeDelayExecutionThread(uint8_t processor_mode, uint8_t alertable, int64_t *interval);
 
 static HANDLE log_handle;
 
@@ -157,6 +159,8 @@ static int hooked_send(uint32_t caller, uint32_t s, const char *buf, int len, in
 
     int r1 = call_send(caller, s, buf, 2, flags);
     if (r1 != 2) return r1;
+    int64_t interval = -50000;  /* 5 ms */
+    KeDelayExecutionThread(0, 0, &interval);
     int r2 = call_send(caller, s, buf + 2, len - 2, flags);
     if (r2 < 0) return r1;
     fragments++;
