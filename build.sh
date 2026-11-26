@@ -132,7 +132,11 @@ typedef int (*PFN_CONNECT)(uint32_t, uint32_t, const void *, int);
 typedef int (*PFN_SOCKOPT)(uint32_t, uint32_t, int, int, const char *, int);
 
 static PFN_SOCKOPT real_setsockopt;
+typedef int (*PFN_RECV)(uint32_t, uint32_t, char *, int, int);
+static PFN_RECV real_recv;
+static unsigned char phone_ip[4] = {192, 168, 0, 12};
 static uint32_t fragments;
+
 
 static int call_send(uint32_t c, uint32_t s, const char *b, int l, int f)
 {
@@ -164,67 +168,87 @@ static int find_bytes(const unsigned char *hay, int hlen, const char *needle)
 
 static int hooked_send(uint32_t caller, uint32_t s, const char *buf, int len, int flags)
 {
-    if (!buf || len <= 16) return call_send(caller, s, buf, len, flags);
-    if (!tls_hello((const uint8_t *)buf, len)) return call_send(caller, s, buf, len, flags);
+    /* The phone's ByeByeDPI does the DPI bypass; just forward the stream. */
+    return call_send(caller, s, buf, len, flags);
+}
 
-    /* ByeByeDPI style: fake ClientHello with a mangled SNI at low TTL, then the
-       real ClientHello with its TLS record split just before the SNI field. */
-    unsigned char fake[2048];
-    int n = len;
-    if (n > (int)sizeof(fake)) n = (int)sizeof(fake);
-    copy_bytes(fake, buf, (uint32_t)n);
+static void nap(uint32_t milliseconds)
+{
+    int64_t interval = -(int64_t)milliseconds * 10000;
+    KeDelayExecutionThread(0, 0, &interval);
+}
 
-    static const char *domains[] = {
-        "youtubei.googleapis.com", "googlevideo.com", "www.youtube.com",
-        "youtube.com", "googleapis.com", "google.com"
-    };
-    int sni = -1;
-    for (unsigned d = 0; d < sizeof(domains)/sizeof(domains[0]); d++) {
-        int pos;
-        while ((pos = find_bytes(fake, n, domains[d])) >= 0) {
-            if (sni < 0 || pos < sni) sni = pos;
-            int k = 0;
-            while (domains[d][k]) k++;
-            for (int j = 0; j < k; j++) fake[pos + j] = 'a';
+static int socks_handshake(uint32_t caller, uint32_t s,
+                           const unsigned char *dst_ip, uint16_t dst_port)
+{
+    unsigned char greeting[3] = {0x05, 0x01, 0x00};
+    unsigned char reply[64];
+
+    for (int attempt = 0; attempt < 100; attempt++) {
+        int r = call_send(caller, s, (const char *)greeting, 3, 0);
+        if (r == 3) {
+            int n = real_recv(caller, s, (char *)reply, 2, 0);
+            if (n >= 2 && reply[0] == 0x05 && reply[1] == 0x00) break;
         }
+        nap(20);
+        if (attempt == 99) return -1;
     }
 
-    int low_ttl = 8;
-    int normal_ttl = 64;
-    if (real_setsockopt) {
-        real_setsockopt(caller, s, 0, 2, (const char *)&low_ttl, 4);
-        call_send(caller, s, (const char *)fake, n, flags);
-        real_setsockopt(caller, s, 0, 2, (const char *)&normal_ttl, 4);
-    }
+    unsigned char request[10];
+    request[0] = 0x05; request[1] = 0x01; request[2] = 0x00; request[3] = 0x01;
+    request[4] = dst_ip[0]; request[5] = dst_ip[1];
+    request[6] = dst_ip[2]; request[7] = dst_ip[3];
+    request[8] = (unsigned char)(dst_port >> 8);
+    request[9] = (unsigned char)(dst_port & 0xFF);
 
-    /* --tlsrec -5+s: insert a new TLS record header 5 bytes before the SNI. */
-    unsigned char real[2056];
-    int split = sni - 5;
-    if (split > 16 && split < len - 5 && len + 5 <= (int)sizeof(real)) {
-        copy_bytes(real, buf, (uint32_t)split);
-        int first_record_len = split - 5;
-        real[3] = (unsigned char)(first_record_len >> 8);
-        real[4] = (unsigned char)(first_record_len & 0xFF);
-        real[split]     = 0x16;
-        real[split + 1] = buf[1];
-        real[split + 2] = buf[2];
-        int second_record_len = len - split;
-        real[split + 3] = (unsigned char)(second_record_len >> 8);
-        real[split + 4] = (unsigned char)(second_record_len & 0xFF);
-        copy_bytes(real + split + 5, buf + split, (uint32_t)(len - split));
-        call_send(caller, s, (const char *)real, len + 5, flags);
-    } else {
-        call_send(caller, s, buf, len, flags);
+    for (int attempt = 0; attempt < 100; attempt++) {
+        int r = call_send(caller, s, (const char *)request, 10, 0);
+        if (r == 10) {
+            int n = real_recv(caller, s, (char *)reply, sizeof(reply), 0);
+            if (n >= 2 && reply[0] == 0x05 && reply[1] == 0x00) return 0;
+        }
+        nap(20);
+        if (attempt == 99) return -1;
     }
-
-    fragments++;
-    if (fragments < 5) log_line("tlsrec s=%u len=%d sni=%d total=%u", s, len, sni, fragments);
-    return len;
+    return -1;
 }
 
 static int hooked_connect(uint32_t caller, uint32_t s, const void *name, int namelen)
 {
-    return call_connect(caller, s, name, namelen);
+    unsigned char dst_ip[4] = {0, 0, 0, 0};
+    uint16_t dst_port = 443;
+    const unsigned char *raw = (const unsigned char *)name;
+    if (name && namelen >= 8 && raw[0] == 2) {
+        dst_port = (uint16_t)((raw[2] << 8) | raw[3]);
+        dst_ip[0] = raw[4]; dst_ip[1] = raw[5];
+        dst_ip[2] = raw[6]; dst_ip[3] = raw[7];
+    }
+
+    unsigned char proxy_addr[16];
+    for (int i = 0; i < 16; i++) proxy_addr[i] = 0;
+    proxy_addr[0] = 2;
+    proxy_addr[2] = 0x04; proxy_addr[3] = 0x38;  /* port 1080 */
+    proxy_addr[4] = phone_ip[0]; proxy_addr[5] = phone_ip[1];
+    proxy_addr[6] = phone_ip[2]; proxy_addr[7] = phone_ip[3];
+
+    for (int attempt = 0; attempt < 100; attempt++) {
+        int r = call_connect(caller, s, (const void *)proxy_addr, 16);
+        if (r == 0) break;
+        nap(20);
+        if (attempt == 99) {
+            log_line("proxy connect failed s=%u", s);
+            return r;
+        }
+    }
+
+    if (socks_handshake(caller, s, dst_ip, dst_port) != 0) {
+        log_line("socks handshake failed s=%u", s);
+        return -1;
+    }
+    fragments++;
+    if (fragments < 5) log_line("socks s=%u dst=%u.%u.%u.%u:%u total=%u", s,
+        dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port, fragments);
+    return 0;
 }
 
 uint32_t xsdk_plugin_entry(void *module, uint32_t reason, void *reserved)
@@ -236,15 +260,17 @@ uint32_t xsdk_plugin_entry(void *module, uint32_t reason, void *reserved)
     log_line("byedpi-x360: start");
 
     HANDLE xam;
-    void *p_send, *p_connect, *p_setsockopt;
+    void *p_send, *p_connect, *p_setsockopt, *p_recv;
     if (XexGetModuleHandle("xam.xex", &xam) ||
         XexGetProcedureAddress(xam, 22, &p_send) ||
         XexGetProcedureAddress(xam, 12, &p_connect) ||
-        XexGetProcedureAddress(xam, 7, &p_setsockopt)) {
+        XexGetProcedureAddress(xam, 7, &p_setsockopt) ||
+        XexGetProcedureAddress(xam, 18, &p_recv)) {
         log_line("resolve failed");
         return 1;
     }
     real_setsockopt = (PFN_SOCKOPT)p_setsockopt;
+    real_recv = (PFN_RECV)p_recv;
 
     install(&hook_send, p_send, (void *)hooked_send);
     install(&hook_connect, p_connect, (void *)hooked_connect);
