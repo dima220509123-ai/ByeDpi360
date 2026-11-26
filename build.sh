@@ -149,23 +149,55 @@ static int tls_hello(const uint8_t *p, int len)
     return p[0] == 0x16 && p[1] == 0x03 && p[5] == 0x01 ? 1 : 0;
 }
 
+static int find_bytes(const unsigned char *hay, int hlen, const char *needle)
+{
+    int nlen = 0;
+    while (needle[nlen]) nlen++;
+    if (!nlen || nlen > hlen) return -1;
+    for (int i = 0; i <= hlen - nlen; i++) {
+        int j = 0;
+        while (j < nlen && hay[i + j] == (unsigned char)needle[j]) j++;
+        if (j == nlen) return i;
+    }
+    return -1;
+}
+
 static int hooked_send(uint32_t caller, uint32_t s, const char *buf, int len, int flags)
 {
-    if (!buf || len <= 2) return call_send(caller, s, buf, len, flags);
+    if (!buf || len <= 6) return call_send(caller, s, buf, len, flags);
     if (!tls_hello((const uint8_t *)buf, len)) return call_send(caller, s, buf, len, flags);
 
-    int nodelay = 1;
-    if (real_setsockopt) real_setsockopt(caller, s, 6, 1, (const char *)&nodelay, 4);
+    /* ByeByeDPI style: fake ClientHello with a mangled SNI, low TTL so only the
+       DPI sees it, then the untouched real ClientHello with a normal TTL. */
+    unsigned char fake[2048];
+    int n = len;
+    if (n > (int)sizeof(fake)) n = (int)sizeof(fake);
+    copy_bytes(fake, buf, (uint32_t)n);
 
-    int r1 = call_send(caller, s, buf, 2, flags);
-    if (r1 != 2) return r1;
-    int64_t interval = -50000;  /* 5 ms */
-    KeDelayExecutionThread(0, 0, &interval);
-    int r2 = call_send(caller, s, buf + 2, len - 2, flags);
-    if (r2 < 0) return r1;
+    static const char *domains[] = {
+        "youtubei.googleapis.com", "googlevideo.com", "www.youtube.com",
+        "youtube.com", "googleapis.com", "google.com"
+    };
+    for (unsigned d = 0; d < sizeof(domains)/sizeof(domains[0]); d++) {
+        int pos;
+        while ((pos = find_bytes(fake, n, domains[d])) >= 0) {
+            int k = 0;
+            while (domains[d][k]) k++;
+            for (int j = 0; j < k; j++) fake[pos + j] = 'a';
+        }
+    }
+
+    int low_ttl = 6;
+    int normal_ttl = 64;
+    if (real_setsockopt) {
+        real_setsockopt(caller, s, 0, 2, (const char *)&low_ttl, 4);
+        call_send(caller, s, (const char *)fake, n, flags);
+        real_setsockopt(caller, s, 0, 2, (const char *)&normal_ttl, 4);
+    }
+
     fragments++;
-    if (fragments < 5) log_line("split s=%u len=%d total=%u", s, len, fragments);
-    return r1 + r2;
+    if (fragments < 5) log_line("fake s=%u len=%d total=%u", s, len, fragments);
+    return call_send(caller, s, buf, len, flags);
 }
 
 static int hooked_connect(uint32_t caller, uint32_t s, const void *name, int namelen)
