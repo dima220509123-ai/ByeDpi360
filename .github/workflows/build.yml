@@ -1,0 +1,22 @@
+name: Build byedpi.xex
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PowerPC cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-powerpc-linux-gnu binutils-powerpc-linux-gnu python3
+      - name: Build XEX
+        run: bash build.sh
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: byedpi-xex
+          path: build/byedpi.xex
+          if-no-files-found: error
