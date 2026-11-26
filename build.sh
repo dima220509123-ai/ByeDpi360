@@ -4,7 +4,7 @@ set -euo pipefail
 # byedpi-x360 — fully self-contained build of a DashLaunch plugin.
 # Everything needed (sources + tools) is generated/downloaded here.
 
-BASE=0x91429000
+BASE=0x91500000
 PPC=powerpc-linux-gnu
 
 echo "== tools =="
