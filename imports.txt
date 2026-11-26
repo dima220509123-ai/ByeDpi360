@@ -1,0 +1,7 @@
+# Only the kernel imports used by plugin.c.
+xboxkrnl.exe  0x0CF  NtClose
+xboxkrnl.exe  0x0D2  NtCreateFile
+xboxkrnl.exe  0x0FF  NtWriteFile
+xboxkrnl.exe  0x14D  _vsnprintf
+xboxkrnl.exe  0x195  XexGetModuleHandle
+xboxkrnl.exe  0x197  XexGetProcedureAddress
