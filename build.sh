@@ -187,7 +187,7 @@ static int hooked_send(uint32_t caller, uint32_t s, const char *buf, int len, in
         }
     }
 
-    int low_ttl = 6;
+    int low_ttl = 8;
     int normal_ttl = 64;
     if (real_setsockopt) {
         real_setsockopt(caller, s, 0, 2, (const char *)&low_ttl, 4);
